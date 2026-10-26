@@ -1,0 +1,652 @@
+#!/usr/bin/env bash
+
+set -u
+
+PROGRAM=${0##*/}
+START_STOPPED=1
+RESTORE_STATE=0
+KEEP_REMOTE=0
+REMOTE_DIR=/tmp
+REMOTE_DIR_SET=0
+EXECUTION_MODE=""
+SNAPSHOT=0
+DELETE_SNAPSHOTS=0
+DELETE_SNAPSHOT_NAME=""
+ALL_CONTAINERS=0
+STATE_FILTER=""
+SNAPSHOT_NAME=""
+
+brief_usage() {
+    cat <<EOF
+Usage: $PROGRAM [options] [VMID ...] --remote COMMAND [ARG ...]
+       $PROGRAM [options] [VMID ...] --local SCRIPT [ARG ...]
+       $PROGRAM [options] [VMID ...] ./SCRIPT [ARG ...]
+       $PROGRAM --delete-snapshots[=NAME] [selection]
+
+  --remote COMMAND ...  Run a command/script already inside each container
+  --local SCRIPT ...    Copy a script from this host, then run it
+  --all                 Select all local containers
+  --running / --stopped Select only running / stopped containers
+  VMID / -VMID          Add to / exclude from a group; exclusions win
+  -n, --no-start         Skip stopped containers
+  -r, --restore-state    Shut down containers started by this run
+  -k, --keep             Keep the copied local script
+  -d, --remote-dir DIR   Copy local script into DIR (default: /tmp)
+  -s, --snapshot[=NAME]  Snapshot first; omit NAME for a timestamped name
+  --delete-snapshots    Delete names matching the automatic snapshot format
+  --delete-snapshots=NAME  Delete only this exact snapshot name
+  -h, --help            FULL HELP: details, snapshot rules, and examples
+
+Put options before --remote, --local, or a local path starting with / or ./.
+Omit selection for the interactive menu. Run '$PROGRAM --help' for full help.
+EOF
+}
+
+usage() {
+    cat <<EOF_HELP
+Usage: $PROGRAM [options] [VMID ...] --remote COMMAND [ARG ...]
+       $PROGRAM [options] [VMID ...] --local SCRIPT [ARG ...]
+       $PROGRAM [options] [VMID ...] ./SCRIPT [ARG ...]
+       $PROGRAM --delete-snapshots[=NAME] [selection]
+
+Run a command already inside Proxmox LXC containers, copy and run a host-side
+script, or delete snapshots. Run on a Proxmox VE host with pct privileges.
+
+Execution modes (choose one):
+  --remote COMMAND ...  Execute a command or script already inside each LXC
+  --local SCRIPT ...    Copy a readable script from this host, then execute it
+
+  A path starting with / or ./ also selects local mode; --local is optional
+  for these paths. Bare filenames such as maintenance.sh require --local.
+  Put all lxcrun options, VMIDs, and exclusions before the local script path
+  or the --remote/--local switch. Everything following the
+  command/script path is passed literally as its arguments, including -y,
+  --help, --running, negative numbers, or --. No extra separator is needed.
+  Omitting VMIDs and group selection switches opens interactive selection.
+  --remote uses the executable inside the container, regardless of whether
+  a file with the same path exists on this host. It never copies a script.
+  Shell expressions require an explicit shell: --remote sh -c 'expression'.
+  --local copies the script into /tmp by default and removes the copy afterward.
+
+Execution options (place before the script path or execution mode switch):
+  -n, --no-start        Skip stopped containers instead of starting them
+  -r, --restore-state   Shut down only containers started by this invocation
+  -k, --keep            Keep the copied local script
+  -d, --remote-dir DIR  Copy local script into absolute DIR (default: /tmp)
+  -s, --snapshot        Create a snapshot with a timestamped name before execution
+  -s=NAME,
+      --snapshot=NAME  Use a custom snapshot name; '=' is required
+
+  Stopped containers are started and left running by default. Templates are
+  skipped. Failures do not stop execution on the remaining selected containers.
+
+Snapshot creation:
+  Snapshots are created before starting a container or copying the script.
+  A failed snapshot skips execution in that container. Skipped containers are
+  not snapshotted. Snapshots are retained after execution.
+  Automatic names use local time: lxcrun-yyyyddmm-hhmmss (year, day, month).
+  All containers in an invocation use the same name. A same-second name
+  collision causes snapshot creation to fail and skips execution there.
+
+Snapshot cleanup (no execution mode or payload):
+  --delete-snapshots       Delete names matching lxcrun-yyyyddmm-hhmmss
+  --delete-snapshots=NAME  Delete only NAME; exact match, no wildcards
+
+  Select containers using VMIDs, --all, --running, or --stopped; group selectors
+  also support exclusions. Omit selection for the interactive menu.
+  The generated format is reserved for cleanup; manually named snapshots
+  using that exact format also match. Named cleanup supports custom names.
+  Missing snapshot names are a no-op; other snapshots are preserved.
+  Selection controls containers only, not which snapshot names match.
+  Cleanup never starts containers, removes locks, or forces deletion.
+  Locked containers are skipped; processing continues on other containers.
+  The summary reports deletions, deletion failures, and container results.
+  Execution modes and options cannot be combined with snapshot cleanup.
+  Requires pvesh and Perl's JSON::PP module.
+
+Container selection (all modes):
+  --all                Select every local container without prompting
+  --running            Select containers running when the list is loaded
+  --stopped            Select containers stopped when the list is loaded
+  -VMID                Exclude a VMID from one of these groups; repeat as needed
+
+  Group selectors are mutually exclusive. Positive VMIDs add containers to the
+  group, regardless of their state. For example: --running 103 -100 -101.
+  Exclusions require a group selector and win over explicit additions.
+  Put selection before the local path or --remote/--local. Duplicate and
+  unmatched exclusions have no effect. Excluded containers are untouched and
+  do not count as skipped or failed. An empty selection succeeds.
+  Each container runs once: group members first, then explicit additions.
+  Added stopped containers start normally; --no-start and --restore-state apply.
+  --stopped selects targets; execution starts them unless --no-start is set.
+  Use --restore-state to shut them down afterward. Cleanup never starts them.
+  The interactive menu shows VMID, hostname, and state. Enter list positions
+  separated by spaces or commas, 'all', or Enter to cancel. A terminal is required.
+
+General options:
+  -h, --help            Show full help; no arguments show a compact overview
+
+Logging and results:
+  Lifecycle events/results go to syslog with tag lxcrun and run=PID.
+  View with: journalctl -t lxcrun
+  Status messages and container banners include VMID/name. Guest output stays
+  unchanged. Final issues identify warnings, failures, and skips by VMID/name.
+  Names fall back to the container list, then 'unknown' if unavailable.
+  Logging failure warns once and does not interrupt execution.
+  Guest output and command arguments are not logged to syslog. Warnings are
+  lxcrun diagnostics, not interpretations of guest output.
+
+Exit status:
+  0  Success, including no matches, help, or an empty interactive selection
+  1  Failed or skipped containers, including locked containers during cleanup
+  2  Invalid arguments or a setup error
+
+Examples:
+  # Run a command on every local container
+  $PROGRAM --all --remote dpkg --configure locales
+
+  # Run on running containers except VMIDs 100 and 101
+  $PROGRAM --running -100 -101 --remote dpkg --configure locales
+
+  # Run a script ALREADY INSIDE those containers, passing -y
+  $PROGRAM --running -100 -101 --remote /root/maintenance.sh -y
+
+  # Copy a script FROM THIS HOST into those containers, then run it with -y
+  $PROGRAM --running -100 -101 --local ./maintenance.sh -y
+
+  # Equivalent shorthand: / and ./ paths select local mode automatically
+  $PROGRAM --running -100 -101 ./maintenance.sh -y
+
+  # Include stopped VMID 103 as well as running containers, excluding 100 and 101
+  $PROGRAM --running 103 -100 -101 ./maintenance.sh -y
+
+  # Run a local script on explicit containers and pass its arguments
+  $PROGRAM 100 101 --local ./configure.sh --environment production
+
+  # Start stopped containers, run a local script, then shut them down again
+  $PROGRAM --stopped --restore-state --local ./upgrade.sh
+
+  # Snapshot first, then execute a command inside selected containers
+  $PROGRAM --snapshot 100 101 --remote dpkg --configure locales
+
+  # Copy to a custom directory and keep the copied script
+  $PROGRAM --keep --remote-dir /root/scripts 100 --local ./audit.sh
+
+  # Create custom snapshots before running a script from this host
+  $PROGRAM --snapshot=before-upgrade --all --local ./upgrade.sh
+
+  # Select containers interactively for a command
+  $PROGRAM --remote uname -a
+
+  # Delete automatically named snapshots from all local containers
+  $PROGRAM --delete-snapshots --all
+
+  # Delete one named snapshot from running containers except VMIDs 100 and 101
+  $PROGRAM --delete-snapshots=before-upgrade --running -100 -101
+EOF_HELP
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    printf "Run '%s --help' for usage and examples.\n" "$PROGRAM" >&2
+    exit 2
+}
+
+# Log lifecycle/results, not command arguments or arbitrary guest output.
+SYSLOG_ENABLED=1
+CURRENT_ID=""
+CURRENT_NAME=unknown
+declare -A CONTAINER_NAMES=()
+ISSUES=()
+
+syslog_result() {
+    local priority=$1 message=$2
+    ((SYSLOG_ENABLED)) || return 0
+    if ! command -v logger >/dev/null 2>&1 ||
+        ! logger -t lxcrun -p "user.$priority" -- "run=$$ $message" 2>/dev/null; then
+        SYSLOG_ENABLED=0
+        printf 'WARNING: syslog logging unavailable; continuing with terminal reporting.\n' >&2
+    fi
+}
+
+report() {
+    local level=$1 format=$2 message priority=info
+    shift 2
+    printf -v message "$format" "$@"
+    message="[${CURRENT_ID} ${CURRENT_NAME}] $message"
+    case $level in
+        error) priority=err ;;
+        warning) priority=warning ;;
+    esac
+    if [[ $level == info ]]; then
+        printf '%s\n' "$message"
+    else
+        printf '%s\n' "$message" >&2
+        ISSUES+=("$message")
+    fi
+    syslog_result "$priority" "$message"
+}
+
+begin_container() {
+    CURRENT_ID=$1
+    CURRENT_NAME=${CONTAINER_NAMES[$1]:-unknown}
+    local config name
+    if config=$(pct config "$1" 2>/dev/null); then
+        name=$(awk '$1 == "hostname:" {print $2; exit}' <<<"$config")
+        CURRENT_NAME=${name:-$CURRENT_NAME}
+    fi
+    report info 'Beginning %s' "$2"
+}
+
+report_issues() {
+    local issue
+    ((${#ISSUES[@]})) || return 0
+    printf '\nContainers with warnings, failures, or skips:\n' >&2
+    for issue in "${ISSUES[@]}"; do
+        printf '  %s\n' "$issue" >&2
+    done
+}
+
+(($#)) || { brief_usage >&2; exit 2; }
+
+VMIDS=()
+EXEC_ARGS=()
+SCRIPT_ARGS=()
+declare -A EXCLUDED_VMIDS=()
+
+exclude_vmid() {
+    local id=$1
+    [[ $id =~ ^[0-9]+$ ]] || die "invalid excluded VMID: -$id"
+    # Treat a zero-padded exclusion as the same numeric VMID, without arithmetic.
+    while [[ $id == 0* && $id != 0 ]]; do
+        id=${id#0}
+    done
+    EXCLUDED_VMIDS[$id]=1
+}
+
+while (($#)); do
+    case $1 in
+        --delete-snapshots) DELETE_SNAPSHOTS=1; shift ;;
+        --delete-snapshots=*)
+            DELETE_SNAPSHOTS=1
+            DELETE_SNAPSHOT_NAME=${1#*=}
+            [[ $DELETE_SNAPSHOT_NAME =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] ||
+                die "snapshot name must be nonempty, start with a letter or digit, and contain only letters, digits, '.', '_', or '-'"
+            [[ $DELETE_SNAPSHOT_NAME != current ]] || die "current is not a deletable snapshot"
+            shift
+            ;;
+        --remote|--local)
+            EXECUTION_MODE=${1#--}
+            shift
+            EXEC_ARGS=("$@")
+            set --
+            break
+            ;;
+        /*|./*)
+            EXECUTION_MODE=local
+            EXEC_ARGS=("$@")
+            set --
+            break
+            ;;
+        --all) ALL_CONTAINERS=1; shift ;;
+        --running|--stopped)
+            [[ -z $STATE_FILTER || $STATE_FILTER == ${1#--} ]] ||
+                die "--running and --stopped cannot be combined"
+            STATE_FILTER=${1#--}
+            shift
+            ;;
+        -n|--no-start) START_STOPPED=0; shift ;;
+        -r|--restore-state) RESTORE_STATE=1; shift ;;
+        -k|--keep) KEEP_REMOTE=1; shift ;;
+        -s|--snapshot) SNAPSHOT=1; shift ;;
+        --snapshot=*|-s=*)
+            SNAPSHOT=1
+            SNAPSHOT_NAME=${1#*=}
+            [[ -n $SNAPSHOT_NAME ]] || die "snapshot name must not be empty"
+            shift
+            ;;
+        -d|--remote-dir)
+            (($# >= 2)) || die "$1 requires a directory"
+            REMOTE_DIR_SET=1
+            REMOTE_DIR=$2
+            shift 2
+            ;;
+        -h|--help) usage; exit 0 ;;
+        --) die "use --remote COMMAND or --local SCRIPT; no -- separator is needed" ;;
+        -[0-9]*) exclude_vmid "${1#-}"; shift ;;
+        -*) die "unknown option: $1" ;;
+        *)
+            if [[ $1 =~ ^[0-9]+$ ]]; then
+                VMIDS+=("$1")
+                shift
+            else
+                die "unexpected argument '$1'; use --local SCRIPT or --remote COMMAND"
+            fi
+            ;;
+    esac
+done
+
+if ((DELETE_SNAPSHOTS)); then
+    [[ -z $EXECUTION_MODE ]] || die "--local and --remote cannot be combined with --delete-snapshots"
+    ((SNAPSHOT == 0 && START_STOPPED == 1 && RESTORE_STATE == 0 && KEEP_REMOTE == 0 && REMOTE_DIR_SET == 0)) ||
+        die "execution options cannot be used with --delete-snapshots"
+    command -v pvesh >/dev/null 2>&1 || die "pvesh is required for snapshot cleanup"
+    command -v perl >/dev/null 2>&1 || die "perl is required for snapshot cleanup"
+elif [[ -n $EXECUTION_MODE ]]; then
+    ((${#EXEC_ARGS[@]})) && [[ -n ${EXEC_ARGS[0]} ]] ||
+        die "--$EXECUTION_MODE requires a command or script followed by optional arguments"
+    if [[ $EXECUTION_MODE == remote ]]; then
+        ((KEEP_REMOTE == 0 && REMOTE_DIR_SET == 0)) ||
+            die "--keep and --remote-dir apply only to local scripts"
+    else
+        LOCAL_SCRIPT=${EXEC_ARGS[0]}
+        SCRIPT_ARGS=("${EXEC_ARGS[@]:1}")
+        [[ -f $LOCAL_SCRIPT ]] || die "local script not found: $LOCAL_SCRIPT"
+        [[ -r $LOCAL_SCRIPT ]] || die "local script is not readable: $LOCAL_SCRIPT"
+        [[ $REMOTE_DIR == /* ]] || die "remote directory must be an absolute path"
+    fi
+else
+    die "choose --local SCRIPT, --remote COMMAND, or --delete-snapshots"
+fi
+command -v pct >/dev/null 2>&1 || die "pct was not found; run $PROGRAM on a Proxmox VE host"
+if ((SNAPSHOT)) && [[ -z $SNAPSHOT_NAME ]]; then
+    SNAPSHOT_NAME="lxcrun-$(date +%Y%d%m-%H%M%S)"
+fi
+
+load_containers() {
+    CONTAINERS=()
+    local id status name rest listing
+    listing=$(pct list) || die "could not list LXC containers"
+    while read -r id status rest; do
+        [[ $id =~ ^[0-9]+$ ]] || continue
+        # Name is the last column; the optional Lock column may be blank.
+        name=${rest##*[[:space:]]}
+        name=${name:-unknown}
+        CONTAINER_NAMES[$id]=$name
+        CONTAINERS+=("$id|$status|$name")
+    done <<<"$listing"
+}
+
+select_containers() {
+    [[ -t 0 && -t 1 ]] || die "no VMIDs supplied and no interactive terminal is available"
+    load_containers
+    ((${#CONTAINERS[@]})) || die "no LXC containers found"
+
+    printf 'Available LXC containers:\n'
+    printf '      %-8s %-24s %s\n' VMID Hostname State
+    local i id status name selection token
+    for i in "${!CONTAINERS[@]}"; do
+        IFS='|' read -r id status name <<<"${CONTAINERS[$i]}"
+        printf '  %2d) %-8s %-24s [%s]\n' "$((i + 1))" "$id" "$name" "$status"
+    done
+    printf '\nChoose one or more numbers (spaces or commas), or "all" [Enter to cancel]: '
+    IFS= read -r selection || exit 1
+    [[ -n $selection ]] || exit 0
+    selection=${selection//,/ }
+
+    if [[ $selection == all ]]; then
+        for i in "${!CONTAINERS[@]}"; do
+            IFS='|' read -r id status name <<<"${CONTAINERS[$i]}"
+            VMIDS+=("$id")
+        done
+        return
+    fi
+
+    for token in $selection; do
+        [[ $token =~ ^[0-9]+$ ]] || die "invalid selection: $token"
+        ((token >= 1 && token <= ${#CONTAINERS[@]})) || die "selection out of range: $token"
+        IFS='|' read -r id status name <<<"${CONTAINERS[$((token - 1))]}"
+        VMIDS+=("$id")
+    done
+}
+
+if ((ALL_CONTAINERS)) && [[ -n $STATE_FILTER ]]; then
+    die "--all cannot be combined with --running or --stopped"
+fi
+if ((${#EXCLUDED_VMIDS[@]})) && ((ALL_CONTAINERS == 0)) && [[ -z $STATE_FILTER ]]; then
+    die "VMID exclusions require --all, --running, or --stopped"
+fi
+if ((ALL_CONTAINERS)) || [[ -n $STATE_FILTER ]]; then
+    EXPLICIT_VMIDS=("${VMIDS[@]}")
+    VMIDS=()
+    load_containers
+    for entry in "${CONTAINERS[@]}"; do
+        IFS='|' read -r id status name <<<"$entry"
+        [[ -z $STATE_FILTER || $status == "$STATE_FILTER" ]] || continue
+        VMIDS+=("$id")
+    done
+    VMIDS+=("${EXPLICIT_VMIDS[@]}")
+else
+    ((${#VMIDS[@]})) || select_containers
+fi
+# Apply exclusions to the combined group and explicit additions, then deduplicate.
+declare -A SEEN=()
+UNIQUE_VMIDS=()
+for id in "${VMIDS[@]}"; do
+    # Canonicalize decimal IDs so padded additions cannot bypass exclusions.
+    while [[ $id == 0* && $id != 0 ]]; do
+        id=${id#0}
+    done
+    [[ ${EXCLUDED_VMIDS[$id]+yes} ]] && continue
+    [[ ${SEEN[$id]+yes} ]] && continue
+    SEEN[$id]=1
+    UNIQUE_VMIDS+=("$id")
+done
+if ((${#UNIQUE_VMIDS[@]} == 0 && DELETE_SNAPSHOTS == 0)); then
+    printf 'No matching LXC containers.\n'
+    exit 0
+fi
+
+# Return 3 for a locked container, 1 for a read error, and 0 otherwise.
+check_cleanup_lock() {
+    local id=$1 config
+    config=$(pct config "$id") || {
+        report error 'ERROR: could not read container configuration'
+        return 1
+    }
+    if grep -q '^lock:[[:space:]]*[^[:space:]]' <<<"$config"; then
+        report warning 'SKIP: container is locked'
+        return 3
+    fi
+}
+
+delete_container_snapshots() {
+    local id=$1 listing names name output rc=0 lock_rc
+    check_cleanup_lock "$id" || return $?
+    listing=$(pvesh get "/nodes/localhost/lxc/$id/snapshot" --output-format json) || {
+        report error 'ERROR: could not list snapshots'
+        return 1
+    }
+    # Parse names from structured data only: descriptions must never be targets.
+    names=$(perl -MJSON::PP -e '
+        my $target = shift @ARGV;
+        local $/;
+        my $snapshots = decode_json(<STDIN>);
+        die "invalid snapshot list\n" unless ref($snapshots) eq "ARRAY";
+        for my $snapshot (@$snapshots) {
+            die "invalid snapshot entry\n" unless ref($snapshot) eq "HASH"
+                && defined($snapshot->{name}) && !ref($snapshot->{name});
+        }
+        for my $snapshot (@$snapshots) {
+            my $name = $snapshot->{name};
+            print "$name\n" if length($target)
+                ? $name eq $target
+                : $name =~ /\Alxcrun-[0-9]{8}-[0-9]{6}\z/;
+        }
+    ' -- "$DELETE_SNAPSHOT_NAME" <<<"$listing") || {
+        report error 'ERROR: could not parse snapshot list'
+        return 1
+    }
+    if [[ -z $names ]]; then
+        report info 'No matching snapshots'
+        return 0
+    fi
+    while IFS= read -r name; do
+        check_cleanup_lock "$id" || return $?
+        report info 'Deleting snapshot %s...' "$name"
+        if output=$(pct delsnapshot "$id" "$name" 2>&1); then
+            [[ -z $output ]] || printf '%s\n' "$output"
+            ((deleted_snapshots++))
+        else
+            printf '%s\n' "$output" >&2
+            # Migration/replication locks may not appear in pct config.
+            if grep -Eqi 'is locked|unable to (acquire|obtain).*lock|failed to (acquire|obtain).*lock|can.t lock|lock.*(timeout|timed out)' <<<"$output"; then
+                report warning 'SKIP: container lock prevented deletion'
+                return 3
+            fi
+            # A lock may have appeared after the preflight check. Never force it.
+            check_cleanup_lock "$id"
+            lock_rc=$?
+            ((lock_rc == 3)) && return 3
+            ((failed_deletions++))
+            report error 'ERROR: could not delete snapshot %s' "$name"
+            ((lock_rc == 0)) || return 1
+            rc=1
+        fi
+    done <<<"$names"
+    return "$rc"
+}
+
+if ((DELETE_SNAPSHOTS)); then
+    deleted_snapshots=0 failed_deletions=0
+    completed_containers=0 locked_containers=0 failed_containers=0
+    for id in "${UNIQUE_VMIDS[@]}"; do
+        begin_container "$id" "snapshot cleanup"
+        delete_container_snapshots "$id"
+        case $? in
+            0) ((completed_containers++)); report info "Cleanup complete" ;;
+            3) ((locked_containers++)) ;;
+            *) ((failed_containers++)) ;;
+        esac
+    done
+    printf 'Snapshot cleanup: %d deleted; %d deletion failures. Containers: %d total, %d completed, %d locked/skipped, %d failed.\n' \
+        "$deleted_snapshots" "$failed_deletions" "${#UNIQUE_VMIDS[@]}" \
+        "$completed_containers" "$locked_containers" "$failed_containers"
+    syslog_result info "Snapshot cleanup: $deleted_snapshots deleted; $failed_deletions deletion failures; $completed_containers completed, $locked_containers locked/skipped, $failed_containers failed containers"
+    report_issues
+    ((failed_containers == 0 && locked_containers == 0 && failed_deletions == 0))
+    exit $?
+fi
+
+wait_until_running() {
+    local id=$1 attempt status
+    for ((attempt = 0; attempt < 30; attempt++)); do
+        status=$(pct status "$id" 2>/dev/null) || return 1
+        [[ $status == *running ]] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+run_in_container() {
+    local id=$1 status config hostname base safe_base remote=""
+    local rc=0 cleanup_rc=0 started_here=0 copied=0
+    status=$(pct status "$id" 2>/dev/null) || {
+        report error 'ERROR: container does not exist or is inaccessible'
+        return 1
+    }
+    config=$(pct config "$id" 2>/dev/null) || {
+        report error 'ERROR: could not read container configuration'
+        return 1
+    }
+    hostname=$(awk '$1 == "hostname:" {print $2; exit}' <<<"$config")
+    hostname=${hostname:-unknown}
+
+    if grep -q '^template:[[:space:]]*1\([[:space:]]\|$\)' <<<"$config"; then
+        report warning 'SKIP: target is a container template'
+        return 1
+    fi
+
+    if [[ $status != *running ]] && ((START_STOPPED == 0)); then
+        report warning 'SKIP: container is not running'
+        return 1
+    fi
+
+    if ((SNAPSHOT)); then
+        report info 'Creating snapshot %s...' "$SNAPSHOT_NAME"
+        if ! pct snapshot "$id" "$SNAPSHOT_NAME"; then
+            report error 'ERROR: snapshot failed; execution skipped'
+            return 1
+        fi
+    fi
+
+    if [[ $status != *running ]]; then
+        report info 'Starting container...'
+        pct start "$id" || {
+            report error 'ERROR: could not start container'
+            return 1
+        }
+        started_here=1
+        if ! wait_until_running "$id"; then
+            report error 'ERROR: container did not become ready'
+            rc=1
+        fi
+    fi
+
+    if [[ $EXECUTION_MODE == remote ]]; then
+        if ((rc == 0)); then
+            printf '[%s %s] Running command:' "$id" "$hostname"
+            printf ' %q' "${EXEC_ARGS[@]}"
+            printf '\n'
+            pct exec "$id" -- "${EXEC_ARGS[@]}" || rc=$?
+        fi
+    else
+        base=${LOCAL_SCRIPT##*/}
+        safe_base=${base//[^[:alnum:]._-]/_}
+        remote="${REMOTE_DIR%/}/lxcrun-$safe_base-$$-$RANDOM"
+        if ((rc == 0)); then
+            report info 'Running %s...' "$base"
+            pct exec "$id" -- mkdir -p -- "$REMOTE_DIR" || rc=$?
+        fi
+        if ((rc == 0)); then
+            pct push "$id" "$LOCAL_SCRIPT" "$remote" || rc=$?
+            ((rc == 0)) && copied=1
+        fi
+        if ((rc == 0)); then
+            pct exec "$id" -- chmod 700 "$remote" || rc=$?
+        fi
+        if ((rc == 0)); then
+            pct exec "$id" -- "$remote" "${SCRIPT_ARGS[@]}" || rc=$?
+        fi
+    fi
+
+    if ((KEEP_REMOTE && copied)); then
+        report info 'Kept script at %s' "$remote"
+    elif ((copied)); then
+        pct exec "$id" -- rm -f -- "$remote" || cleanup_rc=$?
+        if ((cleanup_rc != 0)); then
+            report warning 'WARNING: could not remove %s' "$remote"
+        fi
+    fi
+
+    if ((RESTORE_STATE && started_here)); then
+        report info 'Restoring stopped state...'
+        if ! pct shutdown "$id"; then
+            report error 'ERROR: could not shut down container'
+            ((rc == 0)) && rc=1
+        fi
+    fi
+
+    if ((rc == 0)); then
+        report info 'OK'
+    else
+        report error 'FAILED (exit %d)' "$rc"
+    fi
+    return "$rc"
+}
+
+failures=0
+for id in "${UNIQUE_VMIDS[@]}"; do
+    begin_container "$id" "execution"
+    run_in_container "$id" || ((failures++))
+done
+
+report_issues
+syslog_result info "Execution complete: ${#UNIQUE_VMIDS[@]} containers; $failures failed or skipped; ${#ISSUES[@]} warning/error events"
+
+if ((failures)); then
+    printf '%d of %d container run(s) failed or were skipped.\n' "$failures" "${#UNIQUE_VMIDS[@]}" >&2
+    exit 1
+fi
+
+printf 'Completed successfully on %d container(s).\n' "${#UNIQUE_VMIDS[@]}"
